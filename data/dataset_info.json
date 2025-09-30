@@ -2,6 +2,17 @@
   "identity": {
     "file_name": "identity.json"
   },
+  "coaching_en": {
+  "file_name": "alpaca_smartcoaching_clean.json",
+  "formatting": "alpaca",
+  "columns": {
+    "prompt": "instruction",
+    "query": "input",
+    "response": "output",
+    "history": "history",
+    "system": "system"
+    } 
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },
