@@ -147,15 +147,17 @@ def process_csv(input_csv: str, output_csv: str, aggressive: bool, min_words: in
 def parse_args():
     ap = argparse.ArgumentParser(description="Defiller for advisor turns.")
     ap.add_argument("--input_csv", type=str, required=True)
-    ap.add_argument("--output_csv", type=str, default="source_smartcoaching_final_clean.csv")
-    ap.add_argument("--aggressive", type=str, default="true", help="drop low-info sentences (true/false)")
+    ap.add_argument("--out_folder", type=str, default="./data/coaching_en/")
+    ap.add_argument("--output_csv", type=str, default="smartcoaching_final.csv")
+    ap.add_argument("--aggressive", type=str, default="false", help="drop low-info sentences (true/false)")
     ap.add_argument("--min_words", type=int, default=4, help="min words for a sentence to be kept when aggressive")
     return ap.parse_args()
 
 def main():
     args = parse_args()
     aggressive = str(args.aggressive).lower() in {"1","true","yes","y"}
-    process_csv(args.input_csv, args.output_csv, aggressive, args.min_words)
+    output_path = args.out_folder + args.output_csv
+    process_csv(args.input_csv, output_path, aggressive, args.min_words)
 
 if __name__ == "__main__":
     main()

@@ -1,63 +1,136 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Convert Smart Coaching CSV (final) to LLaMA-Factory Alpaca format — round-based option.
+CSV -> Alpaca JSON/JSONL for LLaMA-Factory (robust session parsing + round-based samples)
 
-Input CSV (source_smartcoaching_final.csv):
+INPUT CSV (required columns):
     conversation_id, turn_index, role, text
+      - conversation_id: e.g., 'Margaret/6030.F.w2.7.27.17.MD.MP3'
+      - role: 'patient' or 'advisor' (final, no 'unknown' please)
+      - text: utterance string
+      - turn_index: int, order within the conversation
 
-Outputs:
+OUTPUTS:
   - alpaca_smartcoaching.jsonl  (one JSON per line)
   - alpaca_smartcoaching.json   (a JSON array)
 
-Key options:
-- --collapse_advisor_runs true  (recommended): produce ONE sample per round
-  where a "round" = consecutive patient block -> consecutive advisor block.
-- --collapse_advisor_runs false: produce one sample per advisor utterance (legacy behavior).
-
-Other options kept:
-- --max_history_pairs N
-- --prefix_roles
-- session/patient metadata injection (same as previous upgraded version)
+CLI EXAMPLE (recommended defaults):
+  python csv_to_alpaca.py \
+    --input_csv source_smartcoaching_final_clean.csv \
+    --out_jsonl alpaca_smartcoaching.jsonl \
+    --out_json  alpaca_smartcoaching.json \
+    --collapse_advisor_runs true \
+    --max_history_pairs 8 \
+    --prefix_roles \
+    --inject_session_in_system false \
+    --emit_metadata false
 """
 
-import argparse, json, re
-from typing import List, Dict, Any, Optional
+import argparse
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 
+# =========================
+# Config: base system prompt
+# =========================
 BASE_SYSTEM_PROMPT = (
-    "You are a supportive weight-loss advisor (coach). "
-    "Be empathetic, specific, and practical. Use SMART goals, reflect back the patient’s situation, "
-    "and suggest concrete next steps. Keep advice safe and non-diagnostic."
+    "You are a supportive weight-loss coach."
+    "Speak naturally and briefly, like a friendly phone call."
+    "Offer practical, specific suggestions with numbers and timeframes when helpful."
+    "Ask one simple check-in question before you wrap up. Avoid medical advice or diagnosis."
 )
 
-# ----- Session parsing (same as before) -----
-SESSION_RX = re.compile(
-    r"(?P<coach>[^/\\]+)[/\\](?P<pid>\d+)\.[A-Za-z]\.w(?P<week>\d+)"
-    r"(?:\.(?P<mon>\d{1,2})\.(?P<day>\d{1,2})\.(?P<hour>\d{1,2}))?",
-    re.IGNORECASE,
-)
+# =========================
+# Robust session-name parser
+# =========================
+
+WEEK_TOKEN_RE   = re.compile(r'^(?:[A-Za-z]*w\.?\d+)$', re.IGNORECASE)  # w12, w.12, Fw10, cAw8
+DIGITS_RE       = re.compile(r'^\d+$')
+ONE2DIGITS_RE   = re.compile(r'^\d{1,2}$')
+
+def _strip_suffixes(fname: str) -> str:
+    """Remove trailing extension; keep base before last dot."""
+    return fname.rsplit('.', 1)[0] if '.' in fname else fname
 
 def parse_session_name(name: str) -> Dict[str, Optional[str]]:
+    """
+    Supports examples like:
+      'Margaret/6030.F.w2.7.27.17.MD.MP3'
+      'Dominique/6375.w.11.10.5.18.DM.MP3'
+      'Dominique/6509.Fw10.4.23.19.DM.MP3'
+      'Leland/6170.cA.w12.02.01.18.LB.MP3'
+
+    Extracts: coach, patient_id, week, month, day, hour (strings or None)
+    """
+    out = {"coach": None, "patient_id": None, "week": None, "month": None, "day": None, "hour": None}
     if not isinstance(name, str) or not name:
-        return {"coach": None, "patient_id": None, "week": None, "month": None, "day": None, "hour": None}
-    m = SESSION_RX.search(name)
-    if not m:
-        return {"coach": None, "patient_id": None, "week": None, "month": None, "day": None, "hour": None}
-    gd = m.groupdict()
-    return {
-        "coach": gd.get("coach"),
-        "patient_id": gd.get("pid"),
-        "week": gd.get("week"),
-        "month": gd.get("mon"),
-        "day": gd.get("day"),
-        "hour": gd.get("hour"),
-    }
+        return out
+
+    parts = re.split(r'[\\/]+', name)
+    if not parts:
+        return out
+    if len(parts) == 1:
+        coach, rest = None, parts[0]
+    else:
+        coach, rest = parts[0], parts[-1]
+        out["coach"] = coach
+
+    rest = _strip_suffixes(rest)  # strip extension like .MP3
+    tokens: List[str] = [t for t in rest.split('.') if t != '']
+    if not tokens:
+        return out
+
+    # Find first all-digit token as patient_id
+    pid_idx = None
+    for i, tok in enumerate(tokens):
+        if DIGITS_RE.match(tok):
+            out["patient_id"] = tok
+            pid_idx = i
+            break
+
+    # Find week token
+    week_idx = None
+    start = (pid_idx + 1) if pid_idx is not None else 0
+    i = start
+    while i < len(tokens):
+        tok = tokens[i]
+        if WEEK_TOKEN_RE.match(tok):
+            m = re.search(r'(\d+)$', tok)
+            if m:
+                out["week"] = m.group(1)
+                week_idx = i
+                break
+        if tok.lower() == 'w' and i + 1 < len(tokens) and DIGITS_RE.match(tokens[i+1]):
+            out["week"] = tokens[i+1]
+            week_idx = i
+            break
+        i += 1
+
+    # Month/Day/Hour as the next 3 one/two-digit tokens after week
+    if week_idx is not None:
+        found: List[str] = []
+        j = week_idx + 1
+        while j < len(tokens) and len(found) < 3:
+            if ONE2DIGITS_RE.match(tokens[j]):
+                found.append(tokens[j])
+            j += 1
+        if len(found) >= 1: out["month"] = found[0]
+        if len(found) >= 2: out["day"]   = found[1]
+        if len(found) >= 3: out["hour"]  = found[2]
+
+    return out
+
+# =========================
+# Helpers
+# =========================
 
 def safe_strip(x: Any) -> str:
     return (str(x).strip()) if isinstance(x, str) else ("" if x is None else str(x))
 
-# ----- Role helpers -----
 def merge_consecutive_same_roles(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not turns: return turns
     merged = [turns[0].copy()]
@@ -73,57 +146,31 @@ def apply_role_prefix(s: str, role: str, prefix_roles: bool) -> str:
         return s
     return f"{'Patient' if role=='patient' else 'Advisor'}: {s}"
 
-# ----- Build rounds (patient block -> advisor block) -----
 def build_rounds(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Returns list of dicts:
-      {
-        'patient_text': "...",  # may be empty if advisor started first
-        'advisor_text': "...",  # may be empty if patient ends
-        'start_idx': int,       # index in 'turns' where patient block starts (or advisor if no patient)
-        'end_idx': int          # index where advisor block ends
-      }
-    """
-    # First merge consecutive same-role turns so blocks are clean
+    """Build patient_block -> advisor_block rounds after merging same-role adjacency."""
     seq = merge_consecutive_same_roles(turns)
     rounds = []
     i = 0
     while i < len(seq):
-        # Expect a patient block first in a round; if advisor appears first, we treat patient_text=""
-        pt_text = ""
-        adv_text = ""
+        pt_text, adv_text = "", ""
         start_idx = i
-
         if seq[i]["role"] == "patient":
-            pt_text = seq[i]["text"]
-            i += 1
-        # collect advisor block (if any) immediately following
+            pt_text = seq[i]["text"]; i += 1
         if i < len(seq) and seq[i]["role"] == "advisor":
-            adv_text = seq[i]["text"]
-            end_idx = i
-            i += 1
+            adv_text = seq[i]["text"]; end_idx = i; i += 1
         else:
-            # no advisor right after (patient-only block)
             end_idx = i - 1
             rounds.append({"patient_text": pt_text, "advisor_text": adv_text, "start_idx": start_idx, "end_idx": end_idx})
             continue
-
-        # finalize the round with both sides captured
         rounds.append({"patient_text": pt_text, "advisor_text": adv_text, "start_idx": start_idx, "end_idx": end_idx})
     return rounds
 
-# ----- History building (pairs) -----
 def build_history_pairs(turns: List[Dict[str, Any]], upto_index: int, max_history_pairs: Optional[int], prefix_roles: bool):
-    """
-    Build patient/user & advisor/assistant pairs using all turns before 'upto_index' (exclusive),
-    merging same-role adjacency for cleaner context.
-    """
+    """History = prior patient/assistant pairs before 'upto_index' (exclusive)."""
     prior = merge_consecutive_same_roles(turns[:upto_index])
-
     history: List[List[str]] = []
     user_buf = None
     asst_buf = None
-
     for t in prior:
         txt = apply_role_prefix(safe_strip(t["text"]), t["role"], prefix_roles)
         if t["role"] == "patient":
@@ -132,69 +179,66 @@ def build_history_pairs(turns: List[Dict[str, Any]], upto_index: int, max_histor
                 user_buf, asst_buf = None, None
             user_buf = txt
         else:  # advisor
-            if user_buf is None:
-                user_buf = ""
+            if user_buf is None: user_buf = ""
             asst_buf = (txt if asst_buf is None else (asst_buf + " " + txt)).strip()
             history.append([user_buf, asst_buf])
             user_buf, asst_buf = None, None
-
     if user_buf is not None or asst_buf is not None:
         history.append([user_buf or "", asst_buf or ""])
-
     if isinstance(max_history_pairs, int) and max_history_pairs > 0:
         history = history[-max_history_pairs:]
-
     return history
 
-# ----- System prompt builder (same idea as before) -----
-def build_system_prompt(base_prompt: str, session: Dict[str, Optional[str]], patient_meta: Optional[Dict[str, Any]]) -> str:
+def build_system_prompt(base_prompt: str, session: Dict[str, Optional[str]], inject: bool) -> str:
+    """
+    Returns a system prompt that optionally appends a compact, structured session header.
+    Header is intentionally stable (same order & labels) so the model can learn to use it.
+    """
+    if not inject:
+        return base_prompt
+
     parts = [base_prompt]
+
+    # Build a consistent state header the model can learn to rely on
+    # e.g., [SESSION] patient_id=6030 | week=2 | date=7/27 17:00
     header_bits = []
-    if session.get("coach"): header_bits.append(f"Coach: {session['coach']}")
-    if session.get("patient_id"): header_bits.append(f"PatientID: {session['patient_id']}")
-    if session.get("week"): header_bits.append(f"Week: {session['week']}")
+    if session.get("patient_id"):
+        header_bits.append(f"patient_id={session['patient_id']}")
+    if session.get("week"):
+        header_bits.append(f"week={session['week']}")
+
+    # show a coarse timestamp if present (not critical, but helps anchoring)
     date_bits = []
-    if session.get("month"): date_bits.append(f"{session['month']}")
-    if session.get("day"): date_bits.append(f"{session['day']}")
-    if session.get("hour"): date_bits.append(f"{session['hour']}:00")
-    if date_bits: header_bits.append("Session time-ish: " + "/".join(date_bits))
-    if header_bits: parts.append(" | ".join(header_bits))
-    if patient_meta:
-        meta_bits = []
-        for k, v in patient_meta.items():
-            vs = safe_strip(v)
-            if vs: meta_bits.append(f"{k}={vs}")
-        if meta_bits:
-            parts.append("Patient profile: " + ", ".join(meta_bits))
+    if session.get("month"): date_bits.append(session["month"])
+    if session.get("day"):   date_bits.append(session["day"])
+    if session.get("hour"):  date_bits.append(f"{session['hour']}:00")
+    if date_bits:
+        header_bits.append("date=" + "/".join(date_bits))
+
+    if header_bits:
+        parts.append("[SESSION] " + " | ".join(header_bits))
+
     return " ".join(parts)
 
-# ----- Main conversion -----
+# =========================
+# Conversion
+# =========================
+
 def convert_csv_to_alpaca(
     input_csv: str,
     out_jsonl: str,
     out_json: str,
     session_name_from: str = "conversation_id",
-    meta_csv: Optional[str] = None,
-    meta_key: str = "patient_id",
     max_history_pairs: Optional[int] = None,
     prefix_roles: bool = False,
-    collapse_advisor_runs: bool = True,   # <—— recommended default
+    collapse_advisor_runs: bool = True,   # recommended
+    inject_session_in_system: bool = False,
+    emit_metadata: bool = False,
 ):
     df = pd.read_csv(input_csv)
     required = {"conversation_id","turn_index","role","text"}
     if not required.issubset(df.columns):
         raise ValueError(f"Missing required columns in {input_csv}. Found: {df.columns}")
-
-    # optional metadata
-    meta_by_pid = {}
-    if meta_csv:
-        meta_df = pd.read_csv(meta_csv)
-        if meta_key not in meta_df.columns:
-            raise ValueError(f"--meta_csv must contain a '{meta_key}' column.")
-        meta_by_pid = {
-            str(row[meta_key]): {k: row[k] for k in meta_df.columns if k != meta_key}
-            for _, row in meta_df.iterrows()
-        }
 
     df = df.sort_values(["conversation_id","turn_index"]).reset_index(drop=True)
     items: List[Dict[str, Any]] = []
@@ -205,65 +249,59 @@ def convert_csv_to_alpaca(
 
         session_source = g[session_name_from].iloc[0] if session_name_from in g.columns else cid
         session = parse_session_name(str(session_source))
-        patient_id = session.get("patient_id")
-        patient_meta = meta_by_pid.get(str(patient_id)) if patient_id else None
-        sys_prompt = build_system_prompt(BASE_SYSTEM_PROMPT, session, patient_meta)
+        sys_prompt = build_system_prompt(BASE_SYSTEM_PROMPT, session, inject=inject_session_in_system)
 
         if collapse_advisor_runs:
-            # Round-based: each patient_block -> advisor_block becomes one sample
             rounds = build_rounds(turns)
-            # We need the history cutoff index for each round. Use the start index of the round.
             seq = merge_consecutive_same_roles(turns)
             for r in rounds:
-                # instruction = patient_text if present; else generic
                 instruction = r["patient_text"] if r["patient_text"] else "Continue the coaching conversation."
                 output = r["advisor_text"]
-                # If no advisor text (patient-only block), skip (no target to learn)
                 if not output: 
-                    continue
-                # Build history up to this round start
+                    continue  # skip patient-only blocks
                 start_idx_in_seq = r["start_idx"]
                 history = build_history_pairs(seq, start_idx_in_seq, max_history_pairs, prefix_roles)
-
-                items.append({
+                item = {
                     "instruction": instruction,
                     "input": "",
                     "output": output,
                     "system": sys_prompt,
                     "history": history,
-                    "metadata": {
+                }
+                if emit_metadata:
+                    item["metadata"] = {
                         "conversation_id": cid,
                         "session_source": session_source,
                         "session_parsed": session
                     }
-                })
+                items.append(item)
         else:
-            # Legacy: one sample per advisor utterance
             seq = merge_consecutive_same_roles(turns)
             for idx, t in enumerate(seq):
-                if t["role"] != "advisor": 
+                if t["role"] != "advisor":
                     continue
-                # instruction = last patient utterance before this advisor
                 instruction = "Continue the coaching conversation."
                 for j in range(idx - 1, -1, -1):
                     if seq[j]["role"] == "patient" and seq[j]["text"]:
                         instruction = seq[j]["text"]
                         break
                 history = build_history_pairs(seq, idx, max_history_pairs, prefix_roles)
-                items.append({
+                item = {
                     "instruction": instruction,
                     "input": "",
                     "output": t["text"],
                     "system": sys_prompt,
                     "history": history,
-                    "metadata": {
+                }
+                if emit_metadata:
+                    item["metadata"] = {
                         "conversation_id": cid,
                         "session_source": session_source,
                         "session_parsed": session
                     }
-                })
+                items.append(item)
 
-    # Write
+    # Write files
     with open(out_jsonl, "w", encoding="utf-8") as f:
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
@@ -274,34 +312,44 @@ def convert_csv_to_alpaca(
     print(f" - JSONL: {out_jsonl}")
     print(f" - JSON:  {out_json}")
 
+# =========================
+# CLI
+# =========================
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="CSV → Alpaca JSON/JSONL (rounds or per-utterance).")
+    ap = argparse.ArgumentParser(description="CSV → Alpaca JSON/JSONL (round-based; robust session parsing).")
     ap.add_argument("--input_csv", type=str, required=True)
+    ap.add_argument("--out_folder", type=str, default="./data/")
     ap.add_argument("--out_jsonl", type=str, default="alpaca_smartcoaching.jsonl")
     ap.add_argument("--out_json", type=str, default="alpaca_smartcoaching.json")
-    ap.add_argument("--session_name_from", type=str, default="conversation_id")
-    ap.add_argument("--meta_csv", type=str, default="")
-    ap.add_argument("--meta_key", type=str, default="patient_id")
-    ap.add_argument("--max_history_pairs", type=int, default=0)
+    ap.add_argument("--session_name_from", type=str, default="conversation_id", help="column to parse session info from")
+    ap.add_argument("--max_history_pairs", type=int, default=8)
     ap.add_argument("--prefix_roles", action="store_true")
     ap.add_argument("--collapse_advisor_runs", type=str, default="true")
+    ap.add_argument("--inject_session_in_system", type=str, default="true", help="if true, append Week/Date to system prompt")
+    ap.add_argument("--metadata", type=str, default="false", help="if true, include metadata block per sample")
     return ap.parse_args()
 
 def main():
     args = parse_args()
-    max_hist = args.max_history_pairs if args.max_history_pairs and args.max_history_pairs > 0 else None
     collapse = str(args.collapse_advisor_runs).lower() in {"1","true","yes","y"}
+    max_hist = args.max_history_pairs if args.max_history_pairs and args.max_history_pairs > 0 else None
+    inject = str(args.inject_session_in_system).lower() in {"1","true","yes","y"}
+    emit = str(args.metadata).lower() in {"1","true","yes","y"}
+    output_json_path = args.out_folder + args.out_json
+    output_jsonl_path = args.out_folder + args.out_jsonl
     convert_csv_to_alpaca(
         input_csv=args.input_csv,
-        out_jsonl=args.out_jsonl,
-        out_json=args.out_json,
+        out_jsonl=output_jsonl_path,
+        out_json=output_json_path,
         session_name_from=args.session_name_from,
-        meta_csv=(args.meta_csv or None),
-        meta_key=args.meta_key,
         max_history_pairs=max_hist,
         prefix_roles=bool(args.prefix_roles),
         collapse_advisor_runs=collapse,
+        inject_session_in_system=inject,
+        emit_metadata=emit,
     )
 
 if __name__ == "__main__":
     main()
+
